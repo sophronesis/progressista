@@ -426,6 +426,30 @@
         }
       }
 
+      function formatDuration(seconds) {
+        if (!isFinite(seconds) || seconds < 0) return "-";
+        seconds = Math.round(seconds);
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = seconds % 60;
+        if (h > 0) return `${h}h${String(m).padStart(2, "0")}m`;
+        if (m > 0) return `${m}m${String(s).padStart(2, "0")}s`;
+        return `${s}s`;
+      }
+
+      function computeEta(task) {
+        // Only meaningful for running tasks with a known total and some progress.
+        if (task.status !== "update") return null;
+        if (!task.total || task.total <= 0) return null;
+        if (!task.n || task.n <= 0) return null;
+        const elapsed = (task.updated_at || 0) - (task.created_at || 0);
+        if (elapsed <= 0) return null;
+        const rate = task.n / elapsed;
+        if (rate <= 0) return null;
+        const remaining = (task.total - task.n) / rate;
+        return remaining;
+      }
+
       function renderCard(task) {
         const status = task.status || "update";
         const desc = task.desc ? ` — ${task.desc}` : "";
@@ -436,6 +460,11 @@
         const updated = task.updated_at
           ? new Date(task.updated_at * 1000).toLocaleTimeString()
           : "";
+        const elapsed = task.created_at && task.updated_at
+          ? formatDuration(task.updated_at - task.created_at)
+          : "-";
+        const etaSec = computeEta(task);
+        const eta = etaSec !== null ? formatDuration(etaSec) : "-";
         const badgeClass =
           status === "close"
             ? "close"
@@ -461,7 +490,10 @@
               <span>${pct}%</span>
             </div>
             <div class="meta">
+              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}` : ""}</span>
               <span>Updated ${updated || "—"}</span>
+            </div>
+            <div class="meta">
               <span>${task.created_at ? `Started ${new Date(task.created_at * 1000).toLocaleTimeString()}` : ""}</span>
             </div>
           </article>
