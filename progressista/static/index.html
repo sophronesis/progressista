@@ -100,6 +100,112 @@
         gap: 0.75rem;
         position: relative;
       }
+      .card[data-depth="1"] {
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.05);
+      }
+      .card[data-depth="2"] {
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
+      }
+      .child-arrow {
+        color: #6b7c93;
+        margin-right: 0.25em;
+        font-weight: 400;
+      }
+      .expand-toggle {
+        background: transparent;
+        border: 0;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 0.85em;
+        color: #6b7c93;
+        margin-right: 0.4em;
+        padding: 0 0.2em;
+        line-height: 1;
+        user-select: none;
+      }
+      .expand-toggle:hover {
+        color: #2563eb;
+      }
+      .child-count-badge {
+        display: inline-block;
+        background: #e0e7f0;
+        color: #4a5568;
+        font-size: 0.7em;
+        font-weight: 500;
+        padding: 0.1em 0.5em;
+        border-radius: 9px;
+        margin-left: 0.5em;
+        vertical-align: middle;
+      }
+      .card-children {
+        margin-top: 0.5rem;
+        padding-top: 0.75rem;
+        border-top: 1px dashed rgba(15, 23, 42, 0.12);
+        display: flex;
+        flex-direction: column;
+        gap: 0.6rem;
+      }
+      .child-row {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        padding: 0.4rem 0.6rem;
+        background: rgba(15, 23, 42, 0.03);
+        border-radius: 8px;
+        border-left: 3px solid #94a3b8;
+      }
+      .child-row[data-status="update"] {
+        border-left-color: #3b82f6;
+      }
+      .child-row[data-status="close"] {
+        border-left-color: #10b981;
+        opacity: 0.75;
+      }
+      .child-row[data-status="failed"], .child-row[data-status="error"] {
+        border-left-color: #ef4444;
+      }
+      .child-row[data-status="stale"] {
+        border-left-color: #f59e0b;
+      }
+      .child-name {
+        font-size: 0.85em;
+        font-weight: 500;
+        color: #334155;
+      }
+      .child-bar {
+        background: rgba(15, 23, 42, 0.08);
+        border-radius: 4px;
+        height: 6px;
+        overflow: hidden;
+      }
+      .child-bar > .fill {
+        height: 100%;
+        background: #3b82f6;
+        transition: width 0.2s ease-out;
+      }
+      .child-row[data-status="close"] .child-bar > .fill { background: #10b981; }
+      .child-row[data-status="failed"] .child-bar > .fill { background: #ef4444; }
+      .child-meta {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.75em;
+        color: #64748b;
+        font-variant-numeric: tabular-nums;
+      }
+      .child-status {
+        display: inline-block;
+        font-size: 0.65em;
+        padding: 0.05em 0.4em;
+        border-radius: 4px;
+        margin-left: 0.5em;
+        background: #e2e8f0;
+        color: #475569;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        font-weight: 500;
+      }
       .card h2 {
         margin: 0;
         font-size: 1rem;
@@ -323,7 +429,29 @@
       }
 
       async function deleteTask(taskId) {
+        // Cascading delete: collect descendants from window.__lastTasks and
+        // remove them too. Otherwise discarding a parent leaves orphan child
+        // cards on the dashboard.
+        const tasks = window.__lastTasks || {};
+        const descendants = [];
+        const stack = [taskId];
+        const seen = new Set([taskId]);
+        while (stack.length) {
+          const current = stack.shift();
+          for (const [tid, t] of Object.entries(tasks)) {
+            const pid = t && t.meta && t.meta.parent_id;
+            if (pid === current && !seen.has(tid)) {
+              seen.add(tid);
+              descendants.push(tid);
+              stack.push(tid);
+            }
+          }
+        }
         try {
+          // delete children first so they don't reorphan into top-level briefly
+          for (const tid of descendants) {
+            await apiDelete(`/tasks/${encodeURIComponent(tid)}`);
+          }
           await apiDelete(`/tasks/${encodeURIComponent(taskId)}`);
         } catch (err) {
           console.error("Failed to delete task", err);
@@ -350,10 +478,14 @@
         const taskId = action.dataset.id;
         if (action.dataset.action === "discard" && taskId) {
           deleteTask(taskId);
+        } else if (action.dataset.action === "toggle-children" && taskId) {
+          toggleParent(taskId);
         }
       });
 
       function render(tasks) {
+        // cache for toggle handler so it can re-render without waiting for ws
+        window.__lastTasks = tasks;
         const entries = Object.values(tasks)
           .map((task) => ({
             ...task,
@@ -371,15 +503,37 @@
           completed: [],
         };
 
+        // Children get bucketed alongside their parent so an outer loop's
+        // completed inner iterations don't surface as separate cards in the
+        // Completed section. Pre-compute parent task locations so we can
+        // route children to the same bucket.
+        const taskById = new Map(entries.map((t) => [t.task_id, t]));
+        const bucketFor = (task) => {
+          if (task.status === "close") return "completed";
+          if (task.status === "recovered") return "recovered";
+          if (task.status === "stale" || task.status === "failed" || task.status === "error") return "stale";
+          return "active";
+        };
+        const parentBucket = (task) => {
+          // walk up parent chain to find the topmost ancestor's natural bucket
+          let cur = task, hops = 0;
+          while (hops++ < 16) {
+            const pid = parentIdOf(cur);
+            if (!pid) break;
+            const parent = taskById.get(pid);
+            if (!parent) break;
+            cur = parent;
+          }
+          return bucketFor(cur);
+        };
+
         for (const task of entries) {
-          if (task.status === "close") {
-            buckets.completed.push(task);
-          } else if (task.status === "recovered") {
-            buckets.recovered.push(task);
-          } else if (task.status === "stale") {
-            buckets.stale.push(task);
+          const pid = parentIdOf(task);
+          // child whose parent is visible: route to parent's bucket
+          if (pid && taskById.has(pid)) {
+            buckets[parentBucket(task)].push(task);
           } else {
-            buckets.active.push(task);
+            buckets[bucketFor(task)].push(task);
           }
         }
 
@@ -394,6 +548,109 @@
         clearRecoveredBtn.disabled = buckets.recovered.length === 0;
       }
 
+      function parentIdOf(task) {
+        // Children declare their parent via meta.parent_id (set at create time).
+        // Returns null if no parent or the parent_id is not a visible task.
+        const pid = task && task.meta && task.meta.parent_id;
+        return (pid && typeof pid === "string") ? pid : null;
+      }
+
+      // Per-page expand state: parent_task_id -> bool. Cleared on reload.
+      // Default: collapsed. Stored on window so re-renders preserve it.
+      window.__expandedParents = window.__expandedParents || new Set();
+
+      function toggleParent(taskId) {
+        if (window.__expandedParents.has(taskId)) {
+          window.__expandedParents.delete(taskId);
+        } else {
+          window.__expandedParents.add(taskId);
+        }
+        // trigger immediate re-render with last-known data
+        if (window.__lastTasks) render(window.__lastTasks);
+      }
+
+      function renderChildRow(task) {
+        const pct = (task.progress || 0).toFixed(1);
+        const status = task.status || "update";
+        const desc = task.desc ? ` — ${task.desc}` : "";
+        const current = task.n ?? 0;
+        const total = task.total ?? "∞";
+        const unit = task.unit || "";
+        const elapsed = task.created_at && task.updated_at
+          ? formatDuration(task.updated_at - task.created_at) : "-";
+        const etaSec = computeEta(task);
+        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}` : "";
+        const badge = status !== "update"
+          ? `<span class="child-status status-${status}">${status}</span>` : "";
+        return `
+          <div class="child-row" data-status="${status}">
+            <div class="child-name">${task.task_id}${desc} ${badge}</div>
+            <div class="child-bar"><div class="fill" style="width:${pct}%"></div></div>
+            <div class="child-meta">
+              <span>${current} / ${total} ${unit}</span>
+              <span>${pct}% · ${elapsed}${eta}</span>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderTreeCards(list) {
+        // Group children by parent_id. Children render INSIDE the parent's
+        // own article element (not as separate cards), shown only when the
+        // parent is expanded. Click parent's toggle to reveal/hide.
+        const idSet = new Set(list.map((t) => t.task_id));
+        const childrenOf = new Map();  // parent_id -> [child]
+        const topLevel = [];
+        for (const t of list) {
+          const pid = parentIdOf(t);
+          if (pid && idSet.has(pid)) {
+            if (!childrenOf.has(pid)) childrenOf.set(pid, []);
+            childrenOf.get(pid).push(t);
+          } else {
+            topLevel.push(t);
+          }
+        }
+        const out = [];
+        for (const t of topLevel) {
+          const kids = childrenOf.get(t.task_id) || [];
+          const expanded = window.__expandedParents.has(t.task_id);
+          // Sort children based on parent state:
+          //  - parent still running: latest activity on top, where activity =
+          //    max(created_at, updated_at). Using max picks up freshly spawned
+          //    children even before their first progress update arrives, while
+          //    still floating up actively-ticking older children.
+          //  - parent finished: earliest first (chronological history view)
+          const parentDone = t.status === "close" || t.status === "failed" || t.status === "error";
+          const activityKey = (x) => Math.max(x.created_at || 0, x.updated_at || 0);
+          if (parentDone) {
+            kids.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+          } else {
+            kids.sort((a, b) => activityKey(b) - activityKey(a));
+          }
+          // Visibility rules:
+          //  - expanded: all children
+          //  - collapsed + parent running: preview just the most recent child
+          //    (first in DESC-by-activity sort) so the user sees current progress
+          //    of the inner loop without expanding
+          //  - collapsed + parent done: hide all (clean history view)
+          let visibleKids = [];
+          if (kids.length > 0) {
+            if (expanded) visibleKids = kids;
+            else if (!parentDone) visibleKids = kids.slice(0, 1);
+          }
+          const childrenHtml = visibleKids.length > 0
+            ? `<div class="card-children">${visibleKids.map(renderChildRow).join("")}</div>`
+            : "";
+          out.push(renderCard(t, 0, {
+            hasChildren: kids.length > 0,
+            expanded,
+            childCount: kids.length,
+            childrenHtml,
+          }));
+        }
+        return out.join("");
+      }
+
       function renderBucket(container, name, list) {
         const emptyEl = empties[name];
         if (!list.length) {
@@ -402,7 +659,7 @@
           return;
         }
         emptyEl.hidden = true;
-        container.innerHTML = list.map((task) => renderCard(task)).join("");
+        container.innerHTML = renderTreeCards(list);
       }
 
       function renderCompleted(list) {
@@ -416,7 +673,7 @@
         emptyEl.hidden = true;
         const limit = 6;
         const visible = list.slice(0, limit);
-        completedCards.innerHTML = visible.map((task) => renderCard(task)).join("");
+        completedCards.innerHTML = renderTreeCards(visible);
         const remaining = list.length - visible.length;
         if (remaining > 0) {
           completedExtra.hidden = false;
@@ -450,7 +707,8 @@
         return remaining;
       }
 
-      function renderCard(task) {
+      function renderCard(task, depth = 0, opts = {}) {
+        const { hasChildren = false, expanded = false, childCount = 0, childrenHtml = "" } = opts;
         const status = task.status || "update";
         const desc = task.desc ? ` — ${task.desc}` : "";
         const unit = task.unit || "";
@@ -473,10 +731,20 @@
             : status === "recovered"
             ? "recovered"
             : "";
+        const indentStyle = depth > 0
+          ? `margin-left:${depth * 1.5}rem; border-left: 2px solid #2a4a6a;`
+          : "";
+        const childPrefix = depth > 0 ? '<span class="child-arrow">↳ </span>' : "";
+        const expandToggle = hasChildren
+          ? `<button class="expand-toggle" data-action="toggle-children" data-id="${task.task_id}" title="${expanded ? "collapse" : "expand"} ${childCount} child${childCount === 1 ? "" : "ren"}">${expanded ? "▼" : "▶"}</button>`
+          : "";
+        const childCountBadge = hasChildren && !expanded
+          ? `<span class="child-count-badge">${childCount}</span>`
+          : "";
         return `
-          <article class="card" data-status="${status}">
+          <article class="card" data-status="${status}" data-depth="${depth}" style="${indentStyle}">
             <div class="card-header">
-              <h2>${task.task_id}${desc}</h2>
+              <h2>${expandToggle}${childPrefix}${task.task_id}${desc}${childCountBadge}</h2>
               <div class="card-actions">
                 <span class="badge ${badgeClass}">${status}</span>
                 <button class="card-action" data-action="discard" data-id="${task.task_id}">Discard</button>
@@ -496,6 +764,7 @@
             <div class="meta">
               <span>${task.created_at ? `Started ${new Date(task.created_at * 1000).toLocaleTimeString()}` : ""}</span>
             </div>
+            ${childrenHtml}
           </article>
         `;
       }
