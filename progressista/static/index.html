@@ -685,14 +685,48 @@
       }
 
       function formatDuration(seconds) {
+        // Picks top two adjacent units. Abbreviations: s, m(in), h, d, w,
+        // m(onth), y, c. Minute and month both render as "m" per request -
+        // context (the neighbouring unit) disambiguates: "5m30s" = minutes,
+        // "5m2w" = months.
         if (!isFinite(seconds) || seconds < 0) return "-";
         seconds = Math.round(seconds);
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor((seconds % 3600) / 60);
-        const s = seconds % 60;
-        if (h > 0) return `${h}h${String(m).padStart(2, "0")}m`;
-        if (m > 0) return `${m}m${String(s).padStart(2, "0")}s`;
-        return `${s}s`;
+        const MIN = 60, HOUR = 3600, DAY = 86400, WEEK = 7 * DAY;
+        const MONTH = 30 * DAY, YEAR = 365 * DAY, CENTURY = 100 * YEAR;
+        if (seconds < MIN) return `${seconds}s`;
+        if (seconds < HOUR) {
+          const m = Math.floor(seconds / MIN);
+          const s = seconds % MIN;
+          return `${m}m${String(s).padStart(2, "0")}s`;
+        }
+        if (seconds < DAY) {
+          const h = Math.floor(seconds / HOUR);
+          const m = Math.floor((seconds % HOUR) / MIN);
+          return `${h}h${String(m).padStart(2, "0")}m`;
+        }
+        if (seconds < WEEK) {
+          const d = Math.floor(seconds / DAY);
+          const h = Math.floor((seconds % DAY) / HOUR);
+          return `${d}d${String(h).padStart(2, "0")}h`;
+        }
+        if (seconds < MONTH) {
+          const w = Math.floor(seconds / WEEK);
+          const d = Math.floor((seconds % WEEK) / DAY);
+          return `${w}w${d}d`;
+        }
+        if (seconds < YEAR) {
+          const mo = Math.floor(seconds / MONTH);
+          const w = Math.floor((seconds % MONTH) / WEEK);
+          return `${mo}m${w}w`;
+        }
+        if (seconds < CENTURY) {
+          const y = Math.floor(seconds / YEAR);
+          const mo = Math.floor((seconds % YEAR) / MONTH);
+          return `${y}y${mo}m`;
+        }
+        const c = Math.floor(seconds / CENTURY);
+        const y = Math.floor((seconds % CENTURY) / YEAR);
+        return `${c}c${y}y`;
       }
 
       function formatHHMMSS(unixSec) {
