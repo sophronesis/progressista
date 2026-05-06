@@ -725,6 +725,7 @@
       function render(tasks) {
         // cache for toggle handler so it can re-render without waiting for ws
         window.__lastTasks = tasks;
+        recordSamples(tasks);
         const entries = Object.values(tasks)
           .map((task) => ({
             ...task,
@@ -818,8 +819,10 @@
         const elapsed = task.created_at && task.updated_at
           ? formatDuration(task.updated_at - task.created_at) : "-";
         const etaSec = computeEta(task);
+        const eta2Sec = computeEta2(task);
         const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec, task.created_at) : "";
-        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}${finishAt ? ` (${finishAt})` : ""}` : "";
+        const eta2Str = eta2Sec !== null ? ` · ETA² ${formatDuration(eta2Sec)}` : "";
+        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}${eta2Str}${finishAt ? ` (${finishAt})` : ""}` : "";
         const badge = status !== "update"
           ? `<span class="child-status status-${status}">${status}</span>` : "";
         return `
@@ -1005,6 +1008,91 @@
         return remaining;
       }
 
+      // ---------- ETA² (quadratic fit on cumulative time vs n) -------------
+      // Stores per-task time series of (n, elapsed_since_created) samples so
+      // we can fit t(n) = a*x² + b*x + c with x=n/total. Predicting at x=1
+      // gives a curve-aware ETA that diverges from the linear one when the
+      // task is accelerating or decelerating. Capped FIFO at SAMPLE_CAP.
+      const SAMPLE_CAP = 200;
+      const ETA2_MIN_SAMPLES = 8;
+      window.__samples = window.__samples || new Map();
+
+      function recordSamples(tasks) {
+        const liveIds = new Set();
+        for (const task of Object.values(tasks)) {
+          if (!task.task_id) continue;
+          liveIds.add(task.task_id);
+          if (task.status !== "update") {
+            // Drop history for non-running tasks so a re-run starts fresh.
+            window.__samples.delete(task.task_id);
+            continue;
+          }
+          if (typeof task.n !== "number" || task.n <= 0) continue;
+          if (!task.created_at || !task.updated_at) continue;
+          const elapsed = task.updated_at - task.created_at;
+          if (elapsed <= 0) continue;
+          let arr = window.__samples.get(task.task_id);
+          if (!arr) {
+            arr = [];
+            window.__samples.set(task.task_id, arr);
+          }
+          const last = arr[arr.length - 1];
+          if (last && last.n === task.n && last.t === elapsed) continue;
+          arr.push({ n: task.n, t: elapsed });
+          if (arr.length > SAMPLE_CAP) arr.splice(0, arr.length - SAMPLE_CAP);
+        }
+        // Evict samples for tasks that are no longer in the snapshot.
+        for (const tid of [...window.__samples.keys()]) {
+          if (!liveIds.has(tid)) window.__samples.delete(tid);
+        }
+      }
+
+      function computeEta2(task) {
+        if (task.status !== "update") return null;
+        if (!task.total || task.total <= 0) return null;
+        if (!task.n || task.n <= 0 || task.n >= task.total) return null;
+        const arr = window.__samples.get(task.task_id);
+        if (!arr || arr.length < ETA2_MIN_SAMPLES) return null;
+        // Fit t = a*x² + b*x + c with x = n/total to keep n² and n⁴ moments
+        // bounded - raw n can blow up double-precision when total is huge.
+        let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+        let st = 0, sxt = 0, sx2t = 0;
+        for (const sample of arr) {
+          const x = sample.n / task.total;
+          const t = sample.t;
+          const x2 = x * x, x3 = x2 * x, x4 = x2 * x2;
+          s0 += 1;  s1 += x;  s2 += x2;  s3 += x3;  s4 += x4;
+          st += t;  sxt += x * t;  sx2t += x2 * t;
+        }
+        const M = [[s0, s1, s2], [s1, s2, s3], [s2, s3, s4]];
+        const sol = solve3(M, [st, sxt, sx2t]);
+        if (!sol) return null;
+        const [c, b, a] = sol;
+        // Predict cumulative elapsed at x=1 (i.e. n=total). Coefficients sum.
+        const predicted = a + b + c;
+        if (!isFinite(predicted)) return null;
+        const currentElapsed = task.updated_at - task.created_at;
+        const remaining = predicted - currentElapsed;
+        if (!isFinite(remaining) || remaining < 0) return null;
+        return remaining;
+      }
+
+      function solve3(M, rhs) {
+        // Cramer's rule on a 3x3 system. Cheap, no deps, fine for our size.
+        const det = (m) =>
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+          - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+          + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        const D = det(M);
+        if (!isFinite(D) || Math.abs(D) < 1e-14) return null;
+        const sub = (col) => M.map((row, i) => row.map((v, j) => j === col ? rhs[i] : v));
+        const x = det(sub(0)) / D;
+        const y = det(sub(1)) / D;
+        const z = det(sub(2)) / D;
+        if (![x, y, z].every(isFinite)) return null;
+        return [x, y, z];
+      }
+
       function renderCard(task, depth = 0, opts = {}) {
         const { hasChildren = false, expanded = false, childCount = 0, childrenHtml = "" } = opts;
         const status = task.status || "update";
@@ -1018,7 +1106,9 @@
           ? formatDuration(task.updated_at - task.created_at)
           : "-";
         const etaSec = computeEta(task);
+        const eta2Sec = computeEta2(task);
         const eta = etaSec !== null ? formatDuration(etaSec) : "-";
+        const eta2 = eta2Sec !== null ? formatDuration(eta2Sec) : "";
         const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec, task.created_at) : "";
         const badgeClass =
           status === "close"
@@ -1055,7 +1145,7 @@
               <span>${pct}%</span>
             </div>
             <div class="meta">
-              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}${finishAt ? ` (${finishAt})` : ""}` : ""}</span>
+              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}${eta2 ? ` · ETA² ${eta2}` : ""}${finishAt ? ` (${finishAt})` : ""}` : ""}</span>
               <span>Updated ${updated || "—"}</span>
             </div>
             <div class="meta">
