@@ -579,7 +579,8 @@
         const elapsed = task.created_at && task.updated_at
           ? formatDuration(task.updated_at - task.created_at) : "-";
         const etaSec = computeEta(task);
-        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}` : "";
+        const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec) : "";
+        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}${finishAt ? ` (${finishAt})` : ""}` : "";
         const badge = status !== "update"
           ? `<span class="child-status status-${status}">${status}</span>` : "";
         return `
@@ -694,6 +695,19 @@
         return `${s}s`;
       }
 
+      function formatClockTime(unixSec) {
+        if (!isFinite(unixSec) || unixSec <= 0) return "";
+        const d = new Date(unixSec * 1000);
+        const now = new Date();
+        const sameDay = d.getFullYear() === now.getFullYear()
+          && d.getMonth() === now.getMonth()
+          && d.getDate() === now.getDate();
+        const hhmm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        if (sameDay) return hhmm;
+        const mmdd = d.toLocaleDateString([], { month: "short", day: "numeric" });
+        return `${mmdd} ${hhmm}`;
+      }
+
       function computeEta(task) {
         // Only meaningful for running tasks with a known total and some progress.
         if (task.status !== "update") return null;
@@ -723,6 +737,7 @@
           : "-";
         const etaSec = computeEta(task);
         const eta = etaSec !== null ? formatDuration(etaSec) : "-";
+        const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec) : "";
         const badgeClass =
           status === "close"
             ? "close"
@@ -758,7 +773,7 @@
               <span>${pct}%</span>
             </div>
             <div class="meta">
-              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}` : ""}</span>
+              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}${finishAt ? ` (${finishAt})` : ""}` : ""}</span>
               <span>Updated ${updated || "—"}</span>
             </div>
             <div class="meta">
