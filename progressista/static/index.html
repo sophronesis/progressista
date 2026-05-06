@@ -821,8 +821,9 @@
         const etaSec = computeEta(task);
         const eta2Sec = computeEta2(task);
         const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec, task.created_at) : "";
-        const eta2Str = eta2Sec !== null ? ` · ETA² ${formatDuration(eta2Sec)}` : "";
-        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}${eta2Str}${finishAt ? ` (${finishAt})` : ""}` : "";
+        const finishAt2 = eta2Sec !== null ? formatClockTime((task.updated_at || 0) + eta2Sec, task.created_at) : "";
+        const eta2Str = eta2Sec !== null ? ` · ETA² ${formatDuration(eta2Sec)}${finishAt2 ? ` (${finishAt2})` : ""}` : "";
+        const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}${finishAt ? ` (${finishAt})` : ""}${eta2Str}` : "";
         const badge = status !== "update"
           ? `<span class="child-status status-${status}">${status}</span>` : "";
         return `
@@ -1110,6 +1111,7 @@
         const eta = etaSec !== null ? formatDuration(etaSec) : "-";
         const eta2 = eta2Sec !== null ? formatDuration(eta2Sec) : "";
         const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec, task.created_at) : "";
+        const finishAt2 = eta2Sec !== null ? formatClockTime((task.updated_at || 0) + eta2Sec, task.created_at) : "";
         const badgeClass =
           status === "close"
             ? "close"
@@ -1145,7 +1147,7 @@
               <span>${pct}%</span>
             </div>
             <div class="meta">
-              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}${eta2 ? ` · ETA² ${eta2}` : ""}${finishAt ? ` (${finishAt})` : ""}` : ""}</span>
+              <span>Elapsed ${elapsed} ${etaSec !== null ? `· ETA ${eta}${finishAt ? ` (${finishAt})` : ""}${eta2 ? ` · ETA² ${eta2}${finishAt2 ? ` (${finishAt2})` : ""}` : ""}` : ""}</span>
               <span>Updated ${updated || "—"}</span>
             </div>
             <div class="meta">
