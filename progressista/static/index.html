@@ -294,6 +294,79 @@
         font-size: 0.8rem;
         color: rgba(27, 31, 36, 0.55);
       }
+      .history-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+      }
+      #history-rows {
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+      }
+      .history-row {
+        display: grid;
+        grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) auto auto auto;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.55rem 0.85rem;
+        background: #fff;
+        border-radius: 10px;
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
+        font-size: 0.85rem;
+        font-variant-numeric: tabular-nums;
+        border-left: 3px solid #94a3b8;
+      }
+      .history-row[data-status="close"]         { border-left-color: #10b981; }
+      .history-row[data-status="error"],
+      .history-row[data-status="failed"]        { border-left-color: #ef4444; }
+      .history-row[data-status="stale-evicted"] { border-left-color: #f59e0b; }
+      .history-name {
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .history-name .desc {
+        font-weight: 400;
+        color: rgba(27, 31, 36, 0.6);
+        margin-left: 0.4em;
+      }
+      .history-progress {
+        color: rgba(27, 31, 36, 0.7);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .history-duration,
+      .history-done-at {
+        color: rgba(27, 31, 36, 0.6);
+        font-size: 0.8rem;
+        white-space: nowrap;
+      }
+      .history-row .badge {
+        font-size: 0.65rem;
+        padding: 0.15rem 0.55rem;
+      }
+      @media (max-width: 720px) {
+        .history-row {
+          grid-template-columns: 1fr auto;
+          row-gap: 0.2rem;
+        }
+        .history-progress, .history-duration, .history-done-at { grid-column: 1 / -1; }
+      }
+      @media (prefers-color-scheme: dark) {
+        .history-row {
+          background: #111827;
+          box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+        }
+        .history-name .desc, .history-progress,
+        .history-duration, .history-done-at {
+          color: rgba(226, 232, 240, 0.6);
+        }
+      }
       @media (prefers-color-scheme: dark) {
         :root {
           background: #0f172a;
@@ -368,6 +441,21 @@
         <div id="completed-cards" class="cards compact"></div>
         <div id="completed-empty" class="empty" hidden>No completed tasks.</div>
         <div id="completed-extra" class="more-note" hidden></div>
+      </section>
+      <section class="board" id="history-board">
+        <div class="history-header">
+          <h2>History <span id="history-count" class="more-note"></span></h2>
+          <div class="toolbar-buttons">
+            <button id="history-load" class="secondary" type="button">Show history</button>
+            <button id="history-refresh" class="secondary" type="button" hidden>Refresh</button>
+          </div>
+        </div>
+        <div id="history-rows"></div>
+        <div id="history-empty" class="empty" hidden>No completed runs in history yet.</div>
+        <div class="toolbar" id="history-more-row" hidden>
+          <button id="history-more" class="secondary" type="button">Load more</button>
+          <span id="history-status" class="more-note"></span>
+        </div>
       </section>
     </main>
     <script type="module">
@@ -471,6 +559,157 @@
       clearCompletedBtn.addEventListener("click", () => clearStatus("close"));
       clearStaleBtn.addEventListener("click", () => clearStatus("stale"));
       clearRecoveredBtn.addEventListener("click", () => clearStatus("recovered"));
+
+      // -------- History (sqlite-backed completed runs) ----------------------
+      const historyBoard = document.getElementById("history-board");
+      const historyRows = document.getElementById("history-rows");
+      const historyEmpty = document.getElementById("history-empty");
+      const historyLoadBtn = document.getElementById("history-load");
+      const historyRefreshBtn = document.getElementById("history-refresh");
+      const historyMoreRow = document.getElementById("history-more-row");
+      const historyMoreBtn = document.getElementById("history-more");
+      const historyStatusEl = document.getElementById("history-status");
+      const historyCountEl = document.getElementById("history-count");
+      const PAGE_SIZE = 50;
+      let historyOldestId = null;          // id of last fetched row, used as `before` cursor
+      let historyExhausted = false;
+      let historyLoading = false;
+
+      async function fetchHistory(before) {
+        const search = new URLSearchParams();
+        search.set("limit", String(PAGE_SIZE));
+        if (before !== null && before !== undefined) search.set("before", String(before));
+        if (token) search.set("token", token);
+        const url = `${API_BASE}/history?${search.toString()}`;
+        const res = await fetch(url, { credentials: "same-origin" });
+        if (!res.ok) throw new Error(`history request failed: ${res.status}`);
+        return res.json();
+      }
+
+      async function fetchHistoryStats() {
+        const search = new URLSearchParams();
+        if (token) search.set("token", token);
+        const q = search.toString();
+        const url = q ? `${API_BASE}/history/stats?${q}` : `${API_BASE}/history/stats`;
+        try {
+          const res = await fetch(url, { credentials: "same-origin" });
+          if (!res.ok) return null;
+          return await res.json();
+        } catch (err) {
+          console.error("history stats failed", err);
+          return null;
+        }
+      }
+
+      function renderHistoryRow(run) {
+        const status = run.status || "close";
+        const desc = run.desc ? `<span class="desc">— ${escapeHtml(run.desc)}</span>` : "";
+        const total = (run.total !== null && run.total !== undefined) ? run.total : "∞";
+        const n = run.n_final ?? 0;
+        const pct = (typeof run.total === "number" && run.total > 0)
+          ? Math.min(100, (n / run.total) * 100).toFixed(0) + "%" : "—";
+        const unit = run.unit || "";
+        const duration = formatDuration(run.duration_s || 0);
+        const doneAt = run.done_at ? formatHHMMSS(run.done_at) : "";
+        const doneDate = run.done_at
+          ? new Date(run.done_at * 1000).toLocaleDateString([], { year: "numeric", month: "2-digit", day: "2-digit" })
+          : "";
+        return `
+          <div class="history-row" data-status="${status}" data-id="${run.id}">
+            <div class="history-name">${escapeHtml(run.task_id || "?")}${desc}</div>
+            <div class="history-progress">${n} / ${total} ${escapeHtml(unit)} · ${pct}</div>
+            <div class="history-duration">${duration}</div>
+            <div class="history-done-at">${doneDate} ${doneAt}</div>
+            <div class="history-actions">
+              <span class="badge ${status === "close" ? "close" : status === "stale-evicted" ? "stale" : ""}">${status}</span>
+              <button class="card-action" data-action="history-delete" data-id="${run.id}">Delete</button>
+            </div>
+          </div>
+        `;
+      }
+
+      function escapeHtml(s) {
+        if (s === null || s === undefined) return "";
+        return String(s).replace(/[&<>"']/g, (c) => ({
+          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        }[c]));
+      }
+
+      async function loadHistory(append) {
+        if (historyLoading) return;
+        historyLoading = true;
+        historyStatusEl.textContent = "loading...";
+        try {
+          const before = append ? historyOldestId : null;
+          const payload = await fetchHistory(before);
+          if (!payload.enabled) {
+            historyEmpty.hidden = false;
+            historyEmpty.textContent = "History backend disabled (set PROGRESSISTA_HISTORY_DB_PATH or PROGRESSISTA_STORAGE_PATH).";
+            historyMoreRow.hidden = true;
+            historyLoadBtn.hidden = true;
+            historyRefreshBtn.hidden = true;
+            return;
+          }
+          const runs = payload.runs || [];
+          if (!append) {
+            historyRows.innerHTML = "";
+            historyOldestId = null;
+            historyExhausted = false;
+          }
+          if (runs.length === 0 && !append) {
+            historyEmpty.hidden = false;
+            historyEmpty.textContent = "No completed runs in history yet.";
+            historyMoreRow.hidden = true;
+          } else {
+            historyEmpty.hidden = true;
+            historyRows.insertAdjacentHTML("beforeend", runs.map(renderHistoryRow).join(""));
+            if (runs.length > 0) {
+              historyOldestId = runs[runs.length - 1].id;
+            }
+            if (runs.length < PAGE_SIZE) {
+              historyExhausted = true;
+              historyMoreRow.hidden = true;
+            } else {
+              historyMoreRow.hidden = false;
+            }
+          }
+          historyLoadBtn.hidden = true;
+          historyRefreshBtn.hidden = false;
+          const stats = await fetchHistoryStats();
+          if (stats && stats.enabled) {
+            historyCountEl.textContent = `(${stats.total} run${stats.total === 1 ? "" : "s"})`;
+          }
+        } catch (err) {
+          console.error("history load failed", err);
+          historyStatusEl.textContent = "load failed";
+          return;
+        } finally {
+          historyLoading = false;
+          historyStatusEl.textContent = historyExhausted ? "all loaded" : "";
+        }
+      }
+
+      historyLoadBtn.addEventListener("click", () => loadHistory(false));
+      historyRefreshBtn.addEventListener("click", () => loadHistory(false));
+      historyMoreBtn.addEventListener("click", () => loadHistory(true));
+
+      document.addEventListener("click", async (event) => {
+        const btn = event.target.closest('button[data-action="history-delete"]');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        if (!id) return;
+        try {
+          await apiDelete(`/history/${encodeURIComponent(id)}`);
+          const row = btn.closest(".history-row");
+          if (row) row.remove();
+          const stats = await fetchHistoryStats();
+          if (stats && stats.enabled) {
+            historyCountEl.textContent = `(${stats.total} run${stats.total === 1 ? "" : "s"})`;
+          }
+        } catch (err) {
+          console.error("history delete failed", err);
+        }
+      });
 
       document.addEventListener("click", (event) => {
         const action = event.target.closest("button[data-action]");

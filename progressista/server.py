@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .history import HistoryStore, TERMINAL_STATUSES
 from .settings import ServerSettings
 
 LOGGER = logging.getLogger("progressista.server")
@@ -69,6 +70,23 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         else:
             storage_path = candidate
 
+    # History DB defaults to a sibling of storage_path when only one is set.
+    history_db_path: Path | None = None
+    raw_history = settings.history_db_path
+    if raw_history:
+        history_db_path = Path(raw_history).expanduser()
+    elif storage_path is not None:
+        history_db_path = storage_path.parent / "history.db"
+
+    history: HistoryStore | None = None
+    if history_db_path is not None:
+        try:
+            history = HistoryStore(history_db_path)
+            LOGGER.info("History DB ready at %s", history_db_path)
+        except Exception:
+            LOGGER.exception("Failed to open history DB at %s", history_db_path)
+            history = None
+
     # Mutable state kept on the app object.
     app.state.tasks: Dict[str, Dict[str, Any]] = {}
     app.state.state_lock = asyncio.Lock()
@@ -78,6 +96,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.cleanup_task: asyncio.Task[None] | None = None
     app.state.storage_path = storage_path
     app.state.persist_lock = asyncio.Lock()
+    app.state.history = history
 
     def load_persisted_tasks(path: Path | None) -> Dict[str, Dict[str, Any]]:
         if not path or not path.exists():
@@ -182,6 +201,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 await asyncio.sleep(settings.cleanup_interval)
                 now = time.time()
                 updated = False
+                evicted_for_history: list[Dict[str, Any]] = []
                 async with app.state.state_lock:
                     stale_ids = [
                         task_id
@@ -215,9 +235,20 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                                 stale_changed = True
 
                     for task_id in removed_ids:
-                        app.state.tasks.pop(task_id, None)
+                        data = app.state.tasks.pop(task_id, None)
+                        if (
+                            app.state.history is not None
+                            and data is not None
+                            and data.get("status") not in TERMINAL_STATUSES
+                        ):
+                            # Open task being purged by GC - preserve a row
+                            # so it doesn't vanish silently from history.
+                            evicted_for_history.append(dict(data))
 
                     updated = bool(removed_ids) or stale_changed
+
+                for data in evicted_for_history:
+                    await app.state.history.record(data, "stale-evicted", now)
                 if updated:
                     snapshot = await get_snapshot()
                     await persist_state(snapshot)
@@ -287,6 +318,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         event_dict.setdefault("timestamp", now)
         event_dict.setdefault("status", "update")
 
+        terminal_record: tuple[Dict[str, Any], str, float] | None = None
         async with app.state.state_lock:
             task = app.state.tasks.get(
                 event.task_id,
@@ -298,6 +330,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                     "status": "start",
                 },
             )
+            prev_status = task.get("status")
 
             if event.desc is not None:
                 task["desc"] = event.desc
@@ -314,6 +347,17 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             task["updated_at"] = now
             task["timestamp"] = event_dict["timestamp"]
 
+            new_status = task["status"]
+            if (
+                app.state.history is not None
+                and new_status in TERMINAL_STATUSES
+                and prev_status not in TERMINAL_STATUSES
+            ):
+                # Record once per transition into a terminal state. Snapshot
+                # the task dict because the live one mutates after we release
+                # state_lock.
+                terminal_record = (dict(task), new_status, now)
+
             if task["status"] == "close":
                 task.setdefault("done_at", now)
 
@@ -321,6 +365,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             task.pop("recovered_at", None)
 
             app.state.tasks[event.task_id] = task
+
+        if terminal_record is not None:
+            await app.state.history.record(*terminal_record)
 
         snapshot = await get_snapshot()
         await persist_state(snapshot)
@@ -366,6 +413,49 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             await persist_state(snapshot)
             await broadcast(snapshot)
         return {"removed": bool(removed)}
+
+    @app.get("/history")
+    async def list_history(
+        request: Request,
+        limit: int = 50,
+        before: int | None = None,
+        task_id: str | None = None,
+    ) -> Dict[str, Any]:
+        query_token, header_token = extract_request_tokens(request)
+        require_token(query_token, header_token)
+        if app.state.history is None:
+            return {"runs": [], "enabled": False}
+        runs = await app.state.history.query(limit=limit, before_id=before, task_id=task_id)
+        return {"runs": runs, "enabled": True}
+
+    @app.get("/history/stats")
+    async def history_stats(request: Request) -> Dict[str, Any]:
+        query_token, header_token = extract_request_tokens(request)
+        require_token(query_token, header_token)
+        if app.state.history is None:
+            return {"enabled": False, "total": 0, "by_status": {}}
+        stats = await app.state.history.stats()
+        return {"enabled": True, **stats}
+
+    @app.get("/history/{history_id}")
+    async def get_history(history_id: int, request: Request) -> Dict[str, Any]:
+        query_token, header_token = extract_request_tokens(request)
+        require_token(query_token, header_token)
+        if app.state.history is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="History disabled")
+        row = await app.state.history.get(history_id)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        return row
+
+    @app.delete("/history/{history_id}")
+    async def delete_history(history_id: int, request: Request) -> Dict[str, Any]:
+        query_token, header_token = extract_request_tokens(request)
+        require_token(query_token, header_token)
+        if app.state.history is None:
+            return {"removed": False}
+        removed = await app.state.history.delete(history_id)
+        return {"removed": removed}
 
     @app.delete("/tasks")
     async def bulk_delete_tasks(
