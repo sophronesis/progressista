@@ -579,7 +579,7 @@
         const elapsed = task.created_at && task.updated_at
           ? formatDuration(task.updated_at - task.created_at) : "-";
         const etaSec = computeEta(task);
-        const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec) : "";
+        const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec, task.created_at) : "";
         const eta = etaSec !== null ? ` · ETA ${formatDuration(etaSec)}${finishAt ? ` (${finishAt})` : ""}` : "";
         const badge = status !== "update"
           ? `<span class="child-status status-${status}">${status}</span>` : "";
@@ -695,17 +695,28 @@
         return `${s}s`;
       }
 
-      function formatClockTime(unixSec) {
+      function formatHHMMSS(unixSec) {
         if (!isFinite(unixSec) || unixSec <= 0) return "";
         const d = new Date(unixSec * 1000);
-        const now = new Date();
-        const sameDay = d.getFullYear() === now.getFullYear()
-          && d.getMonth() === now.getMonth()
-          && d.getDate() === now.getDate();
-        const hhmm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        const ss = String(d.getSeconds()).padStart(2, "0");
+        return `${hh}:${mm}:${ss}`;
+      }
+
+      function formatClockTime(unixSec, refSec) {
+        if (!isFinite(unixSec) || unixSec <= 0) return "";
+        const d = new Date(unixSec * 1000);
+        const ref = isFinite(refSec) && refSec > 0 ? new Date(refSec * 1000) : new Date();
+        const sameDay = d.getFullYear() === ref.getFullYear()
+          && d.getMonth() === ref.getMonth()
+          && d.getDate() === ref.getDate();
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        const hhmm = `${hh}:${mm}`;
         if (sameDay) return hhmm;
-        const mmdd = d.toLocaleDateString([], { month: "short", day: "numeric" });
-        return `${mmdd} ${hhmm}`;
+        const ymd = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+        return `${hhmm} ${ymd}`;
       }
 
       function computeEta(task) {
@@ -729,15 +740,13 @@
         const total = task.total ?? "∞";
         const current = task.n ?? 0;
         const pct = task.progress.toFixed(1);
-        const updated = task.updated_at
-          ? new Date(task.updated_at * 1000).toLocaleTimeString()
-          : "";
+        const updated = task.updated_at ? formatHHMMSS(task.updated_at) : "";
         const elapsed = task.created_at && task.updated_at
           ? formatDuration(task.updated_at - task.created_at)
           : "-";
         const etaSec = computeEta(task);
         const eta = etaSec !== null ? formatDuration(etaSec) : "-";
-        const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec) : "";
+        const finishAt = etaSec !== null ? formatClockTime((task.updated_at || 0) + etaSec, task.created_at) : "";
         const badgeClass =
           status === "close"
             ? "close"
@@ -777,7 +786,7 @@
               <span>Updated ${updated || "—"}</span>
             </div>
             <div class="meta">
-              <span>${task.created_at ? `Started ${new Date(task.created_at * 1000).toLocaleTimeString()}` : ""}</span>
+              <span>${task.created_at ? `Started ${formatHHMMSS(task.created_at)}` : ""}</span>
             </div>
             ${childrenHtml}
           </article>
