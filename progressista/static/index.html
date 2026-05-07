@@ -997,21 +997,51 @@
       }
 
       function computeEta(task) {
-        // Rate is "work done since this run began", not "n divided by
-        // elapsed". A task that resumes from n=N (e.g. download restarting
-        // at byte 100MB) has tiny elapsed but big n - using n directly
-        // overestimates rate by ~N× and collapses ETA to nothing.
+        // Two-tier estimator:
+        //  1) Linear least-squares fit of t(x) on the full sample history
+        //     (x = (n - n_start) / (total - n_start)). Smooths warmup
+        //     jitter and short stalls that a single-point rate would
+        //     propagate, and matches ETA² in normalisation so the two
+        //     numbers stay directly comparable. Predicts at x=1.
+        //  2) Snapshot rate fallback before two samples have arrived
+        //     (so ETA shows up on the first update tick, not the second).
+        //
+        // Anchors at n_start so resumed runs (download starting at
+        // byte 100MB out of 1GB) don't overestimate rate by ~N×.
         if (task.status !== "update") return null;
         if (!task.total || task.total <= 0) return null;
         const nStart = task.n_start || 0;
+        const span = task.total - nStart;
+        if (span <= 0) return null;
         const work = (task.n || 0) - nStart;
         if (work <= 0) return null;
+        if (task.n >= task.total) return null;
         const elapsed = (task.updated_at || 0) - (task.created_at || 0);
+
+        const arr = window.__samples.get(task.task_id);
+        if (arr && arr.length >= 2 && elapsed > 0) {
+          let s0 = 0, s1 = 0, s2 = 0, st = 0, sxt = 0;
+          for (const sample of arr) {
+            const x = (sample.n - nStart) / span;
+            const t = sample.t;
+            s0 += 1; s1 += x; s2 += x * x;
+            st += t; sxt += x * t;
+          }
+          const D = s0 * s2 - s1 * s1;
+          if (isFinite(D) && Math.abs(D) > 1e-14) {
+            const a = (s0 * sxt - s1 * st) / D;  // slope
+            const b = (s2 * st - s1 * sxt) / D;  // intercept
+            const predicted = a + b;             // t at x=1, i.e. n=total
+            const remaining = predicted - elapsed;
+            if (isFinite(remaining) && remaining >= 0) return remaining;
+          }
+          // Degenerate fit (zero variance in x, NaN, negative remaining):
+          // fall through to the snapshot rate so we still show something.
+        }
         if (elapsed <= 0) return null;
         const rate = work / elapsed;
         if (rate <= 0) return null;
-        const remaining = (task.total - task.n) / rate;
-        return remaining;
+        return (task.total - task.n) / rate;
       }
 
       // ---------- ETA² (quadratic fit on cumulative time vs n) -------------
