@@ -997,13 +997,18 @@
       }
 
       function computeEta(task) {
-        // Only meaningful for running tasks with a known total and some progress.
+        // Rate is "work done since this run began", not "n divided by
+        // elapsed". A task that resumes from n=N (e.g. download restarting
+        // at byte 100MB) has tiny elapsed but big n - using n directly
+        // overestimates rate by ~N× and collapses ETA to nothing.
         if (task.status !== "update") return null;
         if (!task.total || task.total <= 0) return null;
-        if (!task.n || task.n <= 0) return null;
+        const nStart = task.n_start || 0;
+        const work = (task.n || 0) - nStart;
+        if (work <= 0) return null;
         const elapsed = (task.updated_at || 0) - (task.created_at || 0);
         if (elapsed <= 0) return null;
-        const rate = task.n / elapsed;
+        const rate = work / elapsed;
         if (rate <= 0) return null;
         const remaining = (task.total - task.n) / rate;
         return remaining;
@@ -1051,15 +1056,20 @@
       function computeEta2(task) {
         if (task.status !== "update") return null;
         if (!task.total || task.total <= 0) return null;
-        if (!task.n || task.n <= 0 || task.n >= task.total) return null;
+        const nStart = task.n_start || 0;
+        const span = task.total - nStart;
+        if (span <= 0) return null;
+        if (!task.n || task.n <= nStart || task.n >= task.total) return null;
         const arr = window.__samples.get(task.task_id);
         if (!arr || arr.length < ETA2_MIN_SAMPLES) return null;
-        // Fit t = a*x² + b*x + c with x = n/total to keep n² and n⁴ moments
-        // bounded - raw n can blow up double-precision when total is huge.
+        // Fit t = a*x² + b*x + c with x = (n - n_start) / (total - n_start).
+        // Keeping x in [0,1] over actual work span both bounds the n² / n⁴
+        // moments and re-anchors the parabola at this run's start, so a
+        // resumed task fits the same shape as one that started at zero.
         let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
         let st = 0, sxt = 0, sx2t = 0;
         for (const sample of arr) {
-          const x = sample.n / task.total;
+          const x = (sample.n - nStart) / span;
           const t = sample.t;
           const x2 = x * x, x3 = x2 * x, x4 = x2 * x2;
           s0 += 1;  s1 += x;  s2 += x2;  s3 += x3;  s4 += x4;

@@ -331,6 +331,13 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 },
             )
             prev_status = task.get("status")
+            # n_start anchors ETA on work-done-since-this-run-began rather
+            # than n / elapsed_since_created_at. Without it, a resumed
+            # download arriving with n=100MB and ~0s elapsed would report
+            # an enormous rate and a near-zero ETA. Set once on the first
+            # event we ever see for this task; subsequent events leave it.
+            if "n_start" not in task:
+                task["n_start"] = event.n if event.n is not None else (task.get("n") or 0)
 
             if event.desc is not None:
                 task["desc"] = event.desc
