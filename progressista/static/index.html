@@ -972,6 +972,34 @@
         return `${c}c${y}y`;
       }
 
+      function formatShortDuration(seconds) {
+        // formatDuration rounds to whole seconds and renders <1s as "0s",
+        // which is useless for fast per-iteration timings. Drop into ms
+        // territory below 1s; reuse the full formatter above that.
+        if (!isFinite(seconds) || seconds < 0) return "-";
+        if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+        return formatDuration(seconds);
+      }
+
+      function formatLastIters(task, k = 5) {
+        // Walks back through the per-task sample buffer, computing the
+        // average per-iteration time inside each push interval as
+        // (t_i - t_{i-1}) / (n_i - n_{i-1}). Empty when fewer than two
+        // samples are available, so the line just doesn't render until
+        // there's something meaningful to show.
+        const arr = window.__samples.get(task.task_id);
+        if (!arr || arr.length < 2) return "";
+        const out = [];
+        for (let i = arr.length - 1; i > 0 && out.length < k; i--) {
+          const dn = arr[i].n - arr[i - 1].n;
+          const dt = arr[i].t - arr[i - 1].t;
+          if (dn <= 0 || dt < 0) continue;
+          out.unshift(formatShortDuration(dt / dn));
+        }
+        if (out.length === 0) return "";
+        return `Last ${out.length} iter: ${out.join(", ")}`;
+      }
+
       function formatHHMMSS(unixSec) {
         if (!isFinite(unixSec) || unixSec <= 0) return "";
         const d = new Date(unixSec * 1000);
@@ -1192,6 +1220,7 @@
             </div>
             <div class="meta">
               <span>${task.created_at ? `Started ${formatHHMMSS(task.created_at)}` : ""}</span>
+              <span>${formatLastIters(task)}</span>
             </div>
             ${childrenHtml}
           </article>
